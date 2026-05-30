@@ -123,6 +123,8 @@ class ScreenshotOrganizer:
                         subcategory=getattr(classification, "subcategory", ""),
                         app_name=classification.app_name,
                         destination=str(destination),
+                        source="auto_observed",
+                        confidence=classification.confidence,
                     )
                     remember_session_decision(
                         category=classification.category,
@@ -141,8 +143,9 @@ class ScreenshotOrganizer:
             target_label = f"{classification.category}/{classification.subcategory}"
         confidence_text = ""
         if classification and mode == "smart" and classification.confidence > 0:
-            confidence_text = f" ({round(classification.confidence * 100)}%)"
-        message = f"{action_word} {path.name} to {target_label}{confidence_text}"
+            source_label = self._source_label(classification)
+            confidence_text = f" ({source_label} {round(classification.confidence * 100)}%)" if source_label else f" ({round(classification.confidence * 100)}%)"
+        message = f"{action_word} {path.name} → {target_label}{confidence_text}"
         append_activity(
             "organized",
             message,
@@ -154,6 +157,11 @@ class ScreenshotOrganizer:
             mode=mode,
             app_name=classification.app_name if classification else "Unknown App",
             reason=classification.reason if classification else "",
+            classifier_source=classification.source if classification else "",
+            matched_rule=getattr(classification, "matched_rule", "") if classification else "",
+            debug_signals=getattr(classification, "debug_signals", {}) if classification else {},
+            ocr_enabled=bool(self.config.get("enable_ocr", False)),
+            learning_memory_used=bool(classification and classification.source in {"manual_teach", "folder_learning", "auto_observed"}),
         )
         return OrganizeResult(
             status="organized",
@@ -331,3 +339,16 @@ class ScreenshotOrganizer:
         text = str(value).strip().replace("\\", "/")
         pieces = [self._safe_name(piece) for piece in text.split("/") if piece.strip()]
         return "/".join(pieces) if pieces else "Screenshots"
+
+    def _source_label(self, classification: ClassificationResult) -> str:
+        labels = {
+            "manual_teach": "manual teach match",
+            "app_detection": "app detection",
+            "content_detection": "content match",
+            "folder_learning": "folder learned match",
+            "ocr": "OCR match",
+            "visioncore": "visual match",
+            "fallback_review": "review",
+            "auto_observed": "learned match",
+        }
+        return labels.get(str(classification.source), "")

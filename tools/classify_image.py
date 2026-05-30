@@ -40,10 +40,13 @@ def main() -> int:
     print(f"Subcategory: {result.subcategory or '-'}")
     print(f"Confidence:  {round(result.confidence * 100)}%")
     print(f"Source:      {result.source}")
+    print(f"Rule:        {result.matched_rule or '-'}")
     print(f"App:         {result.app_name}")
     print(f"Reason:      {result.reason}")
     if result.signals:
         print(f"Signals:     {', '.join(result.signals)}")
+    if result.debug_signals:
+        print(f"Debug keys:  {', '.join(sorted(result.debug_signals.keys()))}")
 
     if args.debug:
         profile = _image_profile(image)

@@ -5,7 +5,7 @@ import platform
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -19,6 +19,8 @@ class ClassificationResult:
     source: str = "rules"
     subcategory: str = ""
     signals: Tuple[str, ...] = ()
+    matched_rule: str = ""
+    debug_signals: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -80,6 +82,10 @@ APP_FOLDER_ALIASES: Dict[str, str] = {
     "brave browser": "Brave",
     "visual studio code": "VS Code",
     "code": "VS Code",
+    "code.exe": "VS Code",
+    "cleanshot": "CleanShot",
+    "cleanshot x": "CleanShot",
+    "cleanshot hypersort": "CleanShot",
     "cursor": "Cursor",
     "xcode": "Xcode",
     "discord": "Discord",
@@ -91,6 +97,11 @@ APP_FOLDER_ALIASES: Dict[str, str] = {
     "photos": "Photos",
     "preview": "Preview",
     "terminal": "Terminal",
+    "windowsterminal": "Windows Terminal",
+    "windowsterminal.exe": "Windows Terminal",
+    "explorer": "File Explorer",
+    "explorer.exe": "File Explorer",
+    "file explorer": "File Explorer",
     "iterm2": "iTerm",
     "finder": "Finder",
     "vs code": "VS Code",
@@ -115,6 +126,8 @@ APP_FOLDER_ALIASES: Dict[str, str] = {
     "excel": "Excel",
     "powerpoint": "PowerPoint",
     "teams": "Teams",
+    "discord.exe": "Discord",
+    "chrome.exe": "Chrome",
     "zoom": "Zoom",
     "canva": "Canva",
 }
@@ -355,7 +368,7 @@ CODE_STRONG_WORDS = [
     "function", "const", "let", "var", "class", "import", "export", "return", "console",
     "console.log", "def", "elif", "async", "await", "lambda", "public", "private", "static",
     "extends", "implements", "interface", "namespace", "package", "include", "require", "echo",
-    "select", "insert", "update", "delete", "where", "join", "commit", "pull request",
+    "public static", "select", "from", "insert", "update", "delete", "where", "join", "commit", "pull request",
 ]
 
 CODE_TECH_WORDS = [
@@ -366,11 +379,15 @@ CODE_TECH_WORDS = [
 CODE_SYNTAX_PATTERNS = [
     r"[{};]{2,}",
     r"=>",
+    r"\[[^\]]+\]",
+    r"\([^)]+\)",
     r"</?[a-z][a-z0-9-]*(\s|>|/>)",
     r"\b(if|for|while|switch|catch)\s*\(",
     r"\b(def|class)\s+[a-zA-Z_][a-zA-Z0-9_]*\s*[:(]",
     r"\b(function)\s+[a-zA-Z_$][a-zA-Z0-9_$]*\s*\(",
     r"\b(import|from)\s+[a-zA-Z0-9_./-]+",
+    r"\b(export)\s+(default\s+)?(class|function|const|let|interface|type)\b",
+    r"\b(SELECT|FROM|WHERE|JOIN|ORDER BY|GROUP BY)\b",
     r"\b[A-Za-z_][A-Za-z0-9_]*\s*=\s*['\"0-9\[{]",
     r"\b\d+\s*\|\s*\S+",  # line-number gutter copied by OCR
 ]
@@ -1226,174 +1243,502 @@ def _normalized_text(value: str) -> str:
 # -------------------------
 
 def classify_smart_screenshot(path: Path, config: Dict[str, Any]) -> ClassificationResult:
-    """Hybrid local classifier with visual memory, content rules, app context and review fallback.
+    """Structured local-first Smart Mode pipeline.
 
-    This is intentionally local-first. It does not upload screenshots. It combines:
-    1) ScreenshotDNA visual memory for previously seen visual layouts.
-    2) Strict content classifier.
-    3) App + window title context.
-    4) Session memory for screenshot bursts.
-    5) Conservative fallback to _Review/Other when unsure.
+    Priority order:
+    manual teaching, app identity, code/content, folder learning, OCR/text,
+    visual/layout, review fallback. Screenshots are never uploaded.
     """
-    from .brain import find_neural_match, find_recent_session, find_visual_match
+    from .advanced_recognition import extract_advanced_signals
+    from .brain import find_folder_learned_match, find_manual_teach_match, find_memory_match, find_recent_session
 
     app_name = get_frontmost_app_name() or "Unknown App"
     window_title = get_frontmost_window_title() or ""
     filename_text = _normalized_text(path.stem)
-    ocr_text = _read_text_with_optional_ocr(path, config) if config.get("enable_ocr", False) else ""
+    ocr_enabled = bool(config.get("enable_ocr", False))
+    ocr_text = _read_text_with_optional_ocr(path, config) if ocr_enabled else ""
     full_text = " ".join(part for part in [filename_text, _normalized_text(window_title), ocr_text] if part).strip()
     profile = _image_profile(path)
+    advanced = extract_advanced_signals(path, ocr_text)
 
+    debug: Dict[str, Any] = {
+        "filename_text": filename_text,
+        "window_title": window_title,
+        "ocr_enabled": ocr_enabled,
+        "app_name": app_name,
+        "profile": {
+            "photo": round(profile.photo_score, 3),
+            "text_ui": round(profile.text_ui_score, 3),
+            "layout_text": round(profile.layout_text_score, 3),
+            "edges": round(profile.edge_density, 3),
+        },
+        "advanced": advanced.as_debug(),
+    }
     signals: List[str] = []
 
+    # 1) Explicit manual teaching / corrections. This is intentionally before
+    # all generic learning so one recent correction can beat many old examples.
+    manual = find_manual_teach_match(path, threshold=0.82)
+    if manual:
+        return _classification_from_memory(manual, app_name, signals, debug)
+
+    # 2) Strong app detection, with special handling for code apps where visible
+    # code should become Code/<Language> and app chrome alone should stay Apps/<App>.
+    app_result = _app_specific_smart_result(path, profile, full_text, app_name, window_title, config, debug)
+    if app_result:
+        signals.extend(app_result.signals)
+
+    # 3) Strong code/content detection.
+    content_result = _content_smart_result(path, profile, full_text, app_name, window_title, config, debug)
+    if content_result:
+        signals.extend(content_result.signals)
+
+    if app_result and content_result:
+        if content_result.category == "Code" and content_result.confidence >= 0.84 and app_result.matched_rule in {"code_app_visible_code", "terminal_visible_code"}:
+            return content_result
+        if app_result.confidence >= 0.82 and content_result.confidence < 0.84:
+            return app_result
+        if app_result.category == content_result.category:
+            return app_result if app_result.confidence >= content_result.confidence else content_result
+        return _review_result(
+            config,
+            app_name,
+            tuple(signals),
+            f"Conflicting strong signals: {app_result.category}/{app_result.subcategory or '-'} vs {content_result.category}/{content_result.subcategory or '-'}",
+            "category_conflict",
+            debug,
+            confidence=max(app_result.confidence, content_result.confidence),
+        )
+
+    if app_result and app_result.confidence >= 0.70:
+        return app_result
+    if content_result and content_result.confidence >= 0.70:
+        return content_result
+
+    # 4) Folder-learned patterns. Useful, but deliberately weaker than manual
+    # teaching and strong app/content signals.
     if config.get("enable_neuro_learning", True):
-        threshold = float(config.get("neuro_similarity_threshold", 0.86))
-        neural = find_neural_match(path, threshold=threshold)
-        if neural and neural.confidence >= threshold:
-            return ClassificationResult(
-                category=neural.category,
-                subcategory=neural.subcategory,
-                confidence=neural.confidence,
-                reason=neural.reason or "NeuroVector learned visual match",
-                app_name=app_name,
-                source="neurovector",
-                signals=(f"neuro:{round(neural.confidence * 100)}",),
-            )
+        folder = find_folder_learned_match(path, threshold=max(0.84, float(config.get("neuro_similarity_threshold", 0.86)) - 0.02))
+        if folder:
+            return _classification_from_memory(folder, app_name, signals, debug)
 
-    if config.get("enable_visual_memory", True):
-        distance = int(config.get("visual_similarity_distance", 8))
-        match = find_visual_match(path, max_distance=distance)
-        if match and match.confidence >= 0.78:
-            return ClassificationResult(
-                category=match.category,
-                subcategory=match.subcategory,
-                confidence=match.confidence,
-                reason=match.reason or f"ScreenshotDNA memory match, distance {match.distance}",
-                app_name=app_name,
-                source="screenshot-dna",
-                signals=(f"memory:{match.distance}",),
-            )
+    # 5) OCR/window-title text analysis.
+    text_result = _text_smart_result(full_text, profile, app_name, window_title, config, debug)
+    if text_result and text_result.confidence >= 0.70:
+        return text_result
 
-    # Run the stricter v0.4 content engine, then add subcategory intelligence.
-    content_result = classify_screenshot(path, {**config, "enable_ocr": bool(config.get("enable_ocr", False))})
-    if content_result.confidence > 0:
-        signals.append(f"content:{content_result.category}:{round(content_result.confidence * 100)}")
+    # 6) Visual/layout analysis and very high-confidence auto-observed memory.
+    if config.get("enable_neuro_learning", True):
+        auto_match = find_memory_match(
+            path,
+            threshold=max(0.90, float(config.get("neuro_similarity_threshold", 0.86)) + 0.04),
+            sources={"auto_observed"},
+            matched_rule="auto_observed_memory",
+        )
+        if auto_match:
+            return _classification_from_memory(auto_match, app_name, signals, debug)
 
-    app_category = _category_from_app(app_name)
-    if app_category:
-        signals.append(f"app:{app_category}")
+    visual_result = _visual_smart_result(path, profile, full_text, app_name, window_title, config, debug)
+    if visual_result and visual_result.confidence >= 0.70:
+        return visual_result
 
-    title_category = _category_from_text(full_text, profile)
-    if title_category:
-        signals.append(f"text:{title_category}")
-
-    category_scores: Dict[str, float] = {}
-    reasons: Dict[str, List[str]] = {}
-
-    def add(category: str, amount: float, reason: str) -> None:
-        if not category or category == "Other":
-            return
-        category_scores[category] = category_scores.get(category, 0.0) + amount
-        reasons.setdefault(category, []).append(reason)
-
-    if content_result.category != "Other" and content_result.confidence > 0:
-        add(content_result.category, content_result.confidence, f"content engine: {content_result.reason}")
-
-    if app_category:
-        app_weight = 0.42 if app_category in {"Code", "Design", "Chat", "Games"} else 0.30
-        # Browser apps are noisy; a Chrome screenshot might show a family photo website.
-        if app_category == "Browser" and not _has_url_signal(full_text):
-            app_weight = 0.18
-        add(app_category, app_weight, f"frontmost app: {app_name}")
-
-    if title_category:
-        add(title_category, 0.36, "window title / OCR category hint")
-
-    visual_category = _visual_category(path, profile, full_text)
-    if visual_category:
-        if visual_category == "Photos":
-            visual_weight = 0.52
-        elif visual_category == "Code":
-            visual_weight = 0.42
-        else:
-            visual_weight = 0.24
-        add(visual_category, visual_weight, f"visual profile: photo={profile.photo_score:.2f}, text={profile.text_ui_score:.2f}, layout={profile.layout_text_score:.2f}")
-
-    # Agreement bonus: if two independent signals agree, trust it more.
-    for category, score in list(category_scores.items()):
-        evidence_count = len(reasons.get(category, []))
-        if evidence_count >= 2:
-            category_scores[category] = score + 0.12
-            reasons[category].append("multi-signal agreement")
-
-    if category_scores:
-        ranked = sorted(category_scores.items(), key=lambda item: item[1], reverse=True)
-        best_category, best_score = ranked[0]
-        second_score = ranked[1][1] if len(ranked) > 1 else 0.0
-        margin = best_score - second_score
-        confidence = min(0.96, 0.36 + best_score)
-
-        # Prevent Browser/App from beating a strong photo-like screenshot unless Browser has URL evidence.
-        if best_category == "Browser" and profile.photo_score >= 0.65 and not _has_url_signal(full_text):
-            confidence -= 0.22
-            reasons[best_category].append("browser penalty: photo-like screenshot with no URL signal")
-
-        # Prevent weak Code errors on visual/photo screenshots.
-        if best_category == "Code" and profile.photo_score >= 0.55:
-            confidence -= 0.18
-            reasons[best_category].append("code penalty: image is photo-like")
-
-        # If another category is very close, lower confidence and let review catch it.
-        if margin < 0.16:
-            confidence -= 0.12
-            reasons[best_category].append("low category margin")
-
-        if confidence >= 0.64:
-            # Preserve the content engine's subfolder when it made a strong direct
-            # decision. This matters for cropped code snippets where VisionCore v2
-            # can identify JavaScript from OCR/punctuation, but the window title is
-            # unknown.
-            if content_result.category == best_category and getattr(content_result, "subcategory", ""):
-                subcategory = content_result.subcategory
-            else:
-                subcategory = _smart_subcategory(best_category, full_text, app_name, window_title, profile, config)
-            if not bool(config.get("smart_subfolders", True)):
-                subcategory = ""
-            return ClassificationResult(
-                category=best_category,
-                subcategory=subcategory,
-                confidence=max(0.0, min(0.96, confidence)),
-                reason="; ".join(reasons.get(best_category, [])),
-                app_name=app_name,
-                source="hypersort",
-                signals=tuple(signals),
-            )
-
-    # Burst/session memory: good for taking several screenshots from the same app quickly.
+    # Optional burst/session memory remains weak and late in the pipeline.
     if config.get("enable_session_memory", True):
         session = find_recent_session(app_name, within_minutes=int(config.get("session_context_minutes", 4)))
-        if session:
+        if session and session.confidence >= 0.74:
             return ClassificationResult(
                 category=session.category,
                 subcategory=session.subcategory,
                 confidence=session.confidence,
                 reason="Recent screenshot burst from same app",
                 app_name=app_name,
-                source="session-memory",
-                signals=("session",),
+                source="auto_observed",
+                signals=tuple([*signals, "session"]),
+                matched_rule="session_memory",
+                debug_signals=debug,
             )
 
+    return _review_result(
+        config,
+        app_name,
+        tuple(signals),
+        "No safe Smart Mode decision; sent to review",
+        "low_confidence",
+        debug,
+    )
+
+
+def _classification_from_memory(match: Any, app_name: str, signals: List[str], debug: Dict[str, Any]) -> ClassificationResult:
+    source = str(getattr(match, "source", "") or "folder_learning")
+    source_name = {
+        "manual_teach": "manual_teach",
+        "learn_from_folder": "folder_learning",
+        "auto_observed": "auto_observed",
+    }.get(source, source)
+    rule = str(getattr(match, "matched_rule", "") or source_name)
+    debug_signals = dict(debug)
+    if getattr(match, "debug_signals", None):
+        debug_signals["memory"] = getattr(match, "debug_signals")
+    return ClassificationResult(
+        category=match.category,
+        subcategory=match.subcategory,
+        confidence=match.confidence,
+        reason=match.reason,
+        app_name=app_name,
+        source=source_name,
+        signals=tuple([*signals, f"{source_name}:{round(match.confidence * 100)}"]),
+        matched_rule=rule,
+        debug_signals=debug_signals,
+    )
+
+
+def _review_result(
+    config: Dict[str, Any],
+    app_name: str,
+    signals: Tuple[str, ...],
+    reason: str,
+    matched_rule: str,
+    debug: Dict[str, Any],
+    confidence: float = 0.0,
+) -> ClassificationResult:
     review_folder = str(config.get("review_folder", "_Review")).strip() or "_Review"
     other_folder = str(config.get("other_folder", "Other")).strip() or "Other"
     fallback = review_folder if bool(config.get("review_low_confidence", True)) else other_folder
     return ClassificationResult(
         category=fallback,
-        confidence=0.0,
-        reason="No safe multi-signal decision; sent to review" if fallback == review_folder else "No safe multi-signal decision",
+        confidence=max(0.0, min(0.69, confidence)),
+        reason=reason,
         app_name=app_name,
-        source="review" if fallback == review_folder else "fallback",
-        signals=tuple(signals),
+        source="fallback_review" if fallback == review_folder else "fallback",
+        signals=signals,
+        matched_rule=matched_rule,
+        debug_signals=debug,
     )
+
+
+def _app_specific_smart_result(
+    path: Path,
+    profile: ImageProfile,
+    text: str,
+    app_name: str,
+    window_title: str,
+    config: Dict[str, Any],
+    debug: Dict[str, Any],
+) -> Optional[ClassificationResult]:
+    app_folder = normalize_app_folder(app_name)
+    app_key = _normalized_text(app_folder)
+    combined = _normalized_text(" ".join([text, app_name, window_title]))
+    if app_folder == "Unknown App":
+        return None
+
+    code_app = app_key in {
+        "vs code",
+        "cursor",
+        "xcode",
+        "pycharm",
+        "webstorm",
+        "intellij idea",
+        "android studio",
+        "sublime text",
+        "zed",
+    }
+    terminal_app = app_key in {"terminal", "iterm", "windows terminal", "powershell"}
+    browser_app = app_key in {"chrome", "safari", "firefox", "arc", "brave", "edge", "opera"}
+
+    if code_app or terminal_app:
+        code_result = _strong_code_result(path, profile, text, app_name, window_title, config, debug)
+        if code_result and code_result.confidence >= (0.78 if terminal_app else 0.80):
+            return ClassificationResult(
+                category="Code",
+                subcategory=code_result.subcategory or ("Shell" if terminal_app else "Projects"),
+                confidence=max(code_result.confidence, 0.86 if code_app else 0.82),
+                reason=f"{app_folder} with visible code: {code_result.reason}",
+                app_name=app_name,
+                source="content_detection",
+                signals=(f"app:{app_folder}", "visible_code"),
+                matched_rule="terminal_visible_code" if terminal_app else "code_app_visible_code",
+                debug_signals=debug,
+            )
+        return ClassificationResult(
+            category="Apps",
+            subcategory=app_folder,
+            confidence=0.84 if code_app else 0.81,
+            reason=f"Detected {app_folder} without strong visible code",
+            app_name=app_name,
+            source="app_detection",
+            signals=(f"app:{app_folder}",),
+            matched_rule="app_without_visible_code",
+            debug_signals=debug,
+        )
+
+    if browser_app:
+        site = _browser_subcategory(combined)
+        confidence = 0.88 if site != "Generic Browser" else 0.76
+        return ClassificationResult(
+            category="Browser",
+            subcategory=site,
+            confidence=confidence,
+            reason=f"Detected {app_folder}" + (f" on {site}" if site != "Generic Browser" else ""),
+            app_name=app_name,
+            source="app_detection",
+            signals=(f"app:{app_folder}", f"site:{site}"),
+            matched_rule="browser_app_site",
+            debug_signals=debug,
+        )
+
+    if app_key in {"photos"}:
+        return ClassificationResult(
+            category="Photos",
+            subcategory="Photo Library",
+            confidence=0.86,
+            reason="Detected Photos app",
+            app_name=app_name,
+            source="app_detection",
+            signals=(f"app:{app_folder}",),
+            matched_rule="photos_app",
+            debug_signals=debug,
+        )
+
+    known_app_folders = {
+        "cleanshot",
+        "finder",
+        "file explorer",
+        "discord",
+        "slack",
+        "messages",
+        "whatsapp",
+        "telegram",
+        "figma",
+        "preview",
+        "notion",
+        "obsidian",
+        "word",
+        "excel",
+        "powerpoint",
+        "teams",
+        "zoom",
+        "canva",
+    }
+    if app_key in known_app_folders:
+        confidence = 0.92 if app_key == "cleanshot" else 0.84
+        return ClassificationResult(
+            category="Apps",
+            subcategory=app_folder,
+            confidence=confidence,
+            reason=f"Strong app detection: {app_folder}",
+            app_name=app_name,
+            source="app_detection",
+            signals=(f"app:{app_folder}",),
+            matched_rule="strong_app_detection",
+            debug_signals=debug,
+        )
+
+    return None
+
+
+def _content_smart_result(
+    path: Path,
+    profile: ImageProfile,
+    text: str,
+    app_name: str,
+    window_title: str,
+    config: Dict[str, Any],
+    debug: Dict[str, Any],
+) -> Optional[ClassificationResult]:
+    code_result = _strong_code_result(path, profile, text, app_name, window_title, config, debug)
+    if code_result and code_result.confidence >= 0.78:
+        return code_result
+
+    content = classify_screenshot(path, {**config, "enable_ocr": bool(config.get("enable_ocr", False))})
+    if content.category in {"Other", "Code"} or content.confidence < 0.70:
+        return None
+
+    category = content.category
+    subcategory = content.subcategory
+    source = "content_detection"
+    matched_rule = "content_classifier"
+    if category in {"Chat", "Design", "Games"}:
+        category = "Apps"
+        subcategory = normalize_app_folder(app_name) if normalize_app_folder(app_name) != "Unknown App" else content.category
+        source = "app_detection"
+    elif category == "Video":
+        category = "Media"
+        subcategory = _smart_subcategory("Video", text, app_name, window_title, profile, config)
+    elif not subcategory:
+        subcategory = _smart_subcategory(category, text, app_name, window_title, profile, config)
+
+    return ClassificationResult(
+        category=category,
+        subcategory=subcategory if bool(config.get("smart_subfolders", True)) else "",
+        confidence=content.confidence,
+        reason=content.reason,
+        app_name=app_name,
+        source=source,
+        signals=(f"content:{category}:{round(content.confidence * 100)}",),
+        matched_rule=matched_rule,
+        debug_signals=debug,
+    )
+
+
+def _strong_code_result(
+    path: Path,
+    profile: ImageProfile,
+    text: str,
+    app_name: str,
+    window_title: str,
+    config: Dict[str, Any],
+    debug: Dict[str, Any],
+) -> Optional[ClassificationResult]:
+    language, language_confidence, language_reason = detect_code_language(text, filename=window_title or path.name, app_name=app_name)
+    visual_code = _classify_visual_code(path, profile, app_name)
+    text_code = _classify_code(text, profile, app_name)
+
+    candidates = [item for item in [visual_code, text_code] if item]
+    if not candidates:
+        if language_confidence >= 0.78 and profile.photo_score < 0.50 and (profile.text_ui_score >= 0.45 or profile.layout_text_score >= 0.45):
+            subcategory = language if language != "Projects" else ""
+            debug["language"] = {"name": language, "confidence": round(language_confidence, 3), "reason": language_reason}
+            return ClassificationResult(
+                category="Code",
+                subcategory=subcategory if bool(config.get("smart_subfolders", True)) else "",
+                confidence=min(0.88, language_confidence),
+                reason=f"Code language and text-layout signals: {language_reason}",
+                app_name=app_name,
+                source="content_detection",
+                signals=(f"code:{round(language_confidence * 100)}", f"language:{subcategory or language}"),
+                matched_rule="strong_code_detection",
+                debug_signals=debug,
+            )
+        return None
+    best = max(candidates, key=lambda item: item.confidence)
+    subcategory = best.subcategory or (language if language_confidence >= 0.52 else "")
+    if subcategory == "Projects" and language_confidence >= 0.64:
+        subcategory = language
+    if not subcategory:
+        subcategory = _visual_code_subcategory(path, app_name, text)
+    if not bool(config.get("smart_subfolders", True)):
+        subcategory = ""
+
+    confidence = max(best.confidence, language_confidence if language != "Projects" else 0.0)
+    debug["language"] = {"name": language, "confidence": round(language_confidence, 3), "reason": language_reason}
+    return ClassificationResult(
+        category="Code",
+        subcategory=subcategory,
+        confidence=min(0.96, confidence),
+        reason=best.reason if language_confidence < 0.62 else f"{best.reason}; {language_reason}",
+        app_name=app_name,
+        source="content_detection",
+        signals=(f"code:{round(confidence * 100)}", f"language:{subcategory or language}"),
+        matched_rule="strong_code_detection",
+        debug_signals=debug,
+    )
+
+
+def _text_smart_result(
+    text: str,
+    profile: ImageProfile,
+    app_name: str,
+    window_title: str,
+    config: Dict[str, Any],
+    debug: Dict[str, Any],
+) -> Optional[ClassificationResult]:
+    if not text:
+        return None
+    combined = _normalized_text(" ".join([text, app_name, window_title]))
+    category = _category_from_text(combined, profile)
+    if not category:
+        return None
+    if category == "Browser":
+        subcategory = _browser_subcategory(combined)
+        confidence = 0.78 if subcategory != "Generic Browser" else 0.70
+    elif category == "Code":
+        language, confidence, reason = detect_code_language(combined, filename=window_title, app_name=app_name)
+        if confidence < 0.70:
+            return None
+        subcategory = language if language != "Projects" else ""
+        debug["language"] = {"name": language, "confidence": round(confidence, 3), "reason": reason}
+    elif category == "Photos":
+        subcategory = _smart_subcategory("Photos", combined, app_name, window_title, profile, config)
+        confidence = 0.72
+    elif category in {"Documents"}:
+        subcategory = _smart_subcategory("Documents", combined, app_name, window_title, profile, config)
+        confidence = 0.74
+    elif category in {"Chat", "Design", "Games"}:
+        subcategory = normalize_app_folder(app_name)
+        if subcategory == "Unknown App":
+            subcategory = "Messages" if category == "Chat" else category
+        category = "Apps"
+        confidence = 0.72
+    elif category == "Video":
+        category = "Media"
+        subcategory = _smart_subcategory("Video", combined, app_name, window_title, profile, config)
+        confidence = 0.72
+    else:
+        subcategory = _smart_subcategory(category, combined, app_name, window_title, profile, config)
+        confidence = 0.70
+
+    return ClassificationResult(
+        category=category,
+        subcategory=subcategory if bool(config.get("smart_subfolders", True)) else "",
+        confidence=confidence,
+        reason=f"OCR/window text matched {category}",
+        app_name=app_name,
+        source="ocr" if config.get("enable_ocr", False) else "text_analysis",
+        signals=(f"text:{category}",),
+        matched_rule="ocr_text_analysis",
+        debug_signals=debug,
+    )
+
+
+def _visual_smart_result(
+    path: Path,
+    profile: ImageProfile,
+    text: str,
+    app_name: str,
+    window_title: str,
+    config: Dict[str, Any],
+    debug: Dict[str, Any],
+) -> Optional[ClassificationResult]:
+    category = _visual_category(path, profile, text)
+    if not category:
+        return None
+    if category == "Code":
+        code_result = _strong_code_result(path, profile, text, app_name, window_title, config, debug)
+        if code_result:
+            return code_result
+    subcategory = _smart_subcategory(category, text, app_name, window_title, profile, config)
+    confidence = 0.76 if category == "Photos" else 0.70
+    return ClassificationResult(
+        category=category,
+        subcategory=subcategory if bool(config.get("smart_subfolders", True)) else "",
+        confidence=confidence,
+        reason=f"Visual/layout analysis matched {category}",
+        app_name=app_name,
+        source="visioncore",
+        signals=(f"visual:{category}",),
+        matched_rule="visual_layout_analysis",
+        debug_signals=debug,
+    )
+
+
+def _browser_subcategory(text: str) -> str:
+    if _has_any_keyword(text, ["github", "pull request", "repository", "commit", "issues"]):
+        return "GitHub"
+    if _has_any_keyword(text, ["google", "search results", "search"]):
+        return "Google"
+    if _has_any_keyword(text, ["youtube", "watch", "subscribe"]):
+        return "YouTube"
+    if _has_any_keyword(text, ["documentation", "docs", "developer.mozilla", "api reference"]):
+        return "Documentation"
+    if _has_any_keyword(text, ["stackoverflow", "stack overflow"]):
+        return "Stack Overflow"
+    if _has_any_keyword(text, ["chatgpt", "openai", "codex"]):
+        return "ChatGPT"
+    if _has_any_keyword(text, ["gmail", "mail.google"]):
+        return "Gmail"
+    if _has_any_keyword(text, ["drive.google", "google drive", "docs.google", "google docs"]):
+        return "Drive Docs"
+    return "Generic Browser"
 
 
 def _category_from_text(text: str, profile: ImageProfile) -> Optional[str]:

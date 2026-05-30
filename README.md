@@ -78,23 +78,27 @@ If CleanShot is not confident, it sends the screenshot to `_Review` instead of g
 
 ### Smart Mode
 
-Best mode. Smart Mode combines:
+Best mode. Smart Mode now uses a clear local decision pipeline:
 
-- image structure
-- OCR text when enabled
-- active app detection
-- active window title when available
-- code/editor visual patterns
-- language fingerprints
-- session memory
-- examples you taught it
-- review fallback
+1. Explicit manual teaching / corrections
+2. Strong app detection
+3. Strong code/content detection
+4. Folder-learned patterns
+5. OCR/window-title text analysis
+6. Visual/layout analysis
+7. `_Review` / `Other` fallback
+
+Manual teaching is authoritative. A recent Teach Mode correction can beat older
+folder-learned or auto-observed examples, so one manually taught
+`Apps/CleanShot` dashboard will not be overpowered by old `Code` matches.
 
 Example outputs:
 
 ```txt
 Code/JavaScript
 Code/Python
+Apps/CleanShot
+Apps/VS Code
 Photos/Family
 Browser/GitHub
 Documents/PDFs
@@ -165,7 +169,27 @@ A compact visual hash for near-duplicate and similar screenshot layouts.
 
 ### NeuroVector
 
-A local learning vector created for CleanShot. It lets the app learn from your folders and future corrections.
+A local learning vector created for CleanShot. Brain examples now keep source,
+timestamp, feature vector, perceptual hash, OCR fingerprint, app/window context,
+confidence, confirmations, and override counts.
+
+Learning weights:
+
+- `manual_teach` is strongest and gets a recency boost
+- `learn_from_folder` is useful but weaker
+- `auto_observed` is weakest
+- overridden examples lose weight over time
+
+This prevents wrong older patterns from permanently poisoning Smart Mode.
+
+### Advanced Recognition
+
+`cleanshot/core/advanced_recognition.py` adds optional local hooks for average
+hash, dHash, OCR fingerprints, color histograms, edge density, text-density
+maps, layout segments, and future local-only integrations such as
+`sentence-transformers`, `sklearn`, `onnxruntime`, Apple Vision OCR, or Windows
+OCR. Heavy dependencies are not required by default; missing optional backends
+are skipped safely.
 
 ### Teach Mode
 
@@ -174,8 +198,8 @@ You can correct CleanShot and it learns locally.
 Example:
 
 ```txt
-Correct category: Code
-Correct subfolder: JavaScript
+Correct category: Apps
+Correct subfolder: CleanShot
 ```
 
 Learning data is stored here:
@@ -185,6 +209,16 @@ Learning data is stored here:
 ```
 
 Nothing is uploaded.
+
+Teach Mode includes:
+
+- **Learn From Folders**
+- **Reset Learning Memory**
+- **Open Learning File**
+- **Forget Wrong Matches**
+
+After a teaching action, CleanShot confirms the exact learned destination, for
+example `CleanShot learned this as Apps/CleanShot.`
 
 ---
 
@@ -239,6 +273,9 @@ python3 -m pip install -r requirements-ocr-macos.txt
 
 Then enable OCR in CleanShot Settings.
 
+OCR is optional. Without OCR, Smart Mode still uses app/window context,
+ScreenshotDNA, NeuroVector, VisionCore layout analysis, and filename signals.
+
 ### Windows
 
 Install Tesseract for Windows, then run:
@@ -271,10 +308,27 @@ This prints:
 - subcategory
 - confidence
 - classifier source
+- matched rule
 - active app
 - reason
 - VisionCore debug values
 - LanguageMind result
+
+Additional debug tools:
+
+```bash
+python3 tools/teach_image.py "/path/to/screenshot.png" Apps CleanShot
+python3 tools/debug_brain.py --limit 20
+python3 tools/reset_brain.py
+```
+
+Windows:
+
+```bat
+py tools\teach_image.py "C:\path\to\screenshot.png" Apps CleanShot
+py tools\debug_brain.py --limit 20
+py tools\reset_brain.py
+```
 
 ---
 
@@ -292,8 +346,8 @@ Open the **Teach** tab:
 Example:
 
 ```txt
-Category: Code
-Subcategory: JavaScript
+Category: Apps
+Subcategory: CleanShot
 ```
 
 ### Learn from folders
@@ -309,6 +363,16 @@ CleanShot/Documents/Receipts/receipt.png
 ```
 
 CleanShot reads those folder names and learns the pattern.
+
+Folder learning is intentionally weaker than Teach Mode. It gives Smart Mode
+good hints from your existing organization, but a manual correction wins when
+there is a conflict.
+
+### Reset or forget learning
+
+Use **Reset Learning Memory** in the Teach tab to clear all local learning.
+Use **Forget Wrong Matches** after selecting a category/subcategory to remove
+bad examples for that destination.
 
 ---
 

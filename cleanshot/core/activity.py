@@ -26,6 +26,12 @@ def append_activity(
     mode: str = "",
     app_name: str = "",
     reason: str = "",
+    classifier_source: str = "",
+    matched_rule: str = "",
+    debug_signals: Optional[Dict[str, Any]] = None,
+    ocr_enabled: Optional[bool] = None,
+    learning_memory_used: Optional[bool] = None,
+    **extra: Any,
 ) -> Dict[str, Any]:
     record: Dict[str, Any] = {
         "time": now_iso(),
@@ -39,7 +45,13 @@ def append_activity(
         "mode": mode,
         "app_name": app_name,
         "reason": reason,
+        "classifier_source": classifier_source,
+        "matched_rule": matched_rule,
+        "debug_signals": debug_signals or {},
+        "ocr_enabled": ocr_enabled,
+        "learning_memory_used": learning_memory_used,
     }
+    record.update(extra)
 
     path = activity_path()
     path.parent.mkdir(parents=True, exist_ok=True)

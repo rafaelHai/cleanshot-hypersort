@@ -103,6 +103,12 @@ QMainWindow {
     letter-spacing: -1px;
 }
 
+#CardValueSmall {
+    font-size: 22px;
+    font-weight: 700;
+    color: #0f172a;
+}
+
 #SectionTitle {
     font-size: 18px;
     font-weight: 850;

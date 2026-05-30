@@ -32,7 +32,17 @@ from PySide6.QtWidgets import (
 from cleanshot.core.activity import append_activity
 from cleanshot.core.config import config_path, expand_path, load_config, save_config
 from cleanshot.core.organizer import ScreenshotOrganizer
-from cleanshot.core.brain import brain_path, learn_from_output_folders, memory_count, taught_count, teach_image
+from cleanshot.core.advanced_recognition import recognition_status
+from cleanshot.core.brain import (
+    brain_path,
+    forget_examples,
+    learn_from_output_folders,
+    mark_override,
+    memory_stats,
+    reset_learning_memory,
+    teach_image,
+)
+from cleanshot.core.classifier import classify_smart_screenshot
 from cleanshot.core.stats import FolderSummary, collect_stats, human_size
 from cleanshot.core.watcher import ScreenshotWatcher
 from cleanshot.ui.styles import LIGHT_STYLE
@@ -64,6 +74,7 @@ class MainWindow(QMainWindow):
         self.today_label: QLabel | None = None
         self.mode_label: QLabel | None = None
         self.brain_label: QLabel | None = None
+        self.classifier_status_label: QLabel | None = None
         self.status_label: QLabel | None = None
         self.types_layout: QVBoxLayout | None = None
         self.folders_layout: QVBoxLayout | None = None
@@ -95,8 +106,9 @@ class MainWindow(QMainWindow):
         self.session_memory_checkbox: QCheckBox | None = None
         self.neuro_learning_checkbox: QCheckBox | None = None
         self.teach_file_input: QLineEdit | None = None
-        self.teach_category_input: QLineEdit | None = None
-        self.teach_subcategory_input: QLineEdit | None = None
+        self.teach_category_input: QComboBox | None = None
+        self.teach_subcategory_input: QComboBox | None = None
+        self.teach_status_label: QLabel | None = None
 
         self.stack = QStackedWidget()
         self._build_ui()
@@ -233,12 +245,28 @@ class MainWindow(QMainWindow):
         self.today_label = QLabel("0")
         self.mode_label = QLabel("Day")
         self.brain_label = QLabel("0")
+        self.classifier_status_label = QLabel("Ready")
+
+        # after creating labels
+        self.brain_label.setWordWrap(True)
+        self.classifier_status_label.setWordWrap(True)
+
+        self.brain_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.classifier_status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+
+        self.brain_label.setWordWrap(False)
+        self.classifier_status_label.setWordWrap(False)
 
         cards.addWidget(self._stat_card("Total screenshots", self.total_label), 0, 0)
         cards.addWidget(self._stat_card("Storage used", self.size_label), 0, 1)
         cards.addWidget(self._stat_card("Organized today", self.today_label), 0, 2)
         cards.addWidget(self._stat_card("Current mode", self.mode_label), 0, 3)
-        cards.addWidget(self._stat_card("Learned patterns", self.brain_label), 1, 0)
+        cards.addWidget(self._stat_card("Learned patterns", self.brain_label), 1, 0, 1, 2)
+        cards.addWidget(self._stat_card("Classifier status", self.classifier_status_label), 1, 2, 1, 2)
+        cards.setColumnStretch(0, 1)
+        cards.setColumnStretch(1, 1)
+        cards.setColumnStretch(2, 1)
+        cards.setColumnStretch(3, 1)
         layout.addLayout(cards)
 
         lower_grid = QGridLayout()
@@ -459,10 +487,22 @@ class MainWindow(QMainWindow):
 
         self.teach_file_input = QLineEdit()
         self.teach_file_input.setPlaceholderText("Choose a screenshot that was sorted wrong")
-        self.teach_category_input = QLineEdit()
-        self.teach_category_input.setPlaceholderText("Example: Code, Photos, Browser, Documents")
-        self.teach_subcategory_input = QLineEdit()
-        self.teach_subcategory_input.setPlaceholderText("Optional: JavaScript, Family, GitHub, Receipts")
+        self.teach_category_input = QComboBox()
+        self.teach_category_input.setEditable(True)
+        self.teach_category_input.addItems(["Apps", "Code", "Browser", "Photos", "Documents", "Media", "Other"])
+        self.teach_subcategory_input = QComboBox()
+        self.teach_subcategory_input.setEditable(True)
+        self.teach_subcategory_input.addItems([
+            "CleanShot",
+            "VS Code",
+            "JavaScript",
+            "GitHub",
+            "Family",
+            "Trips",
+            "Receipts",
+            "Discord",
+            "Finder",
+        ])
 
         file_row = QHBoxLayout()
         file_row.addLayout(self._form_row("Screenshot", self.teach_file_input), 1)
@@ -473,10 +513,21 @@ class MainWindow(QMainWindow):
         manual_layout.addLayout(self._form_row("Correct folder / category", self.teach_category_input))
         manual_layout.addLayout(self._form_row("Correct subfolder", self.teach_subcategory_input))
 
+        teach_actions = QHBoxLayout()
         teach_btn = QPushButton("Teach CleanShot")
         teach_btn.setObjectName("PrimaryButton")
         teach_btn.clicked.connect(self.teach_single_screenshot)
-        manual_layout.addWidget(teach_btn)
+        forget_btn = QPushButton("Forget Wrong Matches")
+        forget_btn.clicked.connect(self.forget_wrong_matches)
+        teach_actions.addWidget(teach_btn)
+        teach_actions.addWidget(forget_btn)
+        teach_actions.addStretch(1)
+        manual_layout.addLayout(teach_actions)
+
+        self.teach_status_label = QLabel("Recent teachings will appear here.")
+        self.teach_status_label.setObjectName("MutedText")
+        self.teach_status_label.setWordWrap(True)
+        manual_layout.addWidget(self.teach_status_label)
 
         folder_card = self._card()
         folder_layout = QVBoxLayout(folder_card)
@@ -500,9 +551,15 @@ class MainWindow(QMainWindow):
         learn_btn.clicked.connect(self.learn_from_folders)
         open_brain_btn = QPushButton("Open Brain Folder")
         open_brain_btn.clicked.connect(lambda: self._open_folder(brain_path().parent))
+        open_brain_file_btn = QPushButton("Open Learning File")
+        open_brain_file_btn.clicked.connect(lambda: self._open_file(brain_path()))
+        reset_btn = QPushButton("Reset Learning Memory")
+        reset_btn.clicked.connect(self.reset_learning)
         folder_actions.addWidget(open_output_btn)
         folder_actions.addWidget(learn_btn)
         folder_actions.addWidget(open_brain_btn)
+        folder_actions.addWidget(open_brain_file_btn)
+        folder_actions.addWidget(reset_btn)
         folder_actions.addStretch(1)
         folder_layout.addLayout(folder_actions)
 
@@ -545,18 +602,35 @@ class MainWindow(QMainWindow):
         if not self.teach_file_input or not self.teach_category_input or not self.teach_subcategory_input:
             return
         path = self.teach_file_input.text().strip()
-        category = self.teach_category_input.text().strip()
-        subcategory = self.teach_subcategory_input.text().strip()
+        category = self.teach_category_input.currentText().strip()
+        subcategory = self.teach_subcategory_input.currentText().strip()
         if not path or not category:
             QMessageBox.warning(self, "CleanShot", "Choose a screenshot and type the correct category.")
             return
+        previous = classify_smart_screenshot(Path(path), self.config)
         ok = teach_image(Path(path), category=category, subcategory=subcategory, config=self.config)
         if not ok:
             QMessageBox.warning(self, "CleanShot", "Could not teach from that file. Make sure it is an image.")
             return
-        append_activity("teach", f"Taught CleanShot: {Path(path).name} -> {category}{('/' + subcategory) if subcategory else ''}", path, "")
+        if previous.category not in {category, "_Review", "Other", "Review"} or previous.subcategory != subcategory:
+            mark_override(previous.category, previous.subcategory, category, subcategory)
+        label = category + (("/" + subcategory) if subcategory else "")
+        append_activity(
+            "teach",
+            f"CleanShot learned {Path(path).name} as {label}",
+            path,
+            "",
+            category=category,
+            subcategory=subcategory,
+            confidence=1.0,
+            classifier_source="manual_teach",
+            matched_rule="manual_teach_override",
+            reason=f"Manual correction from {previous.category}{('/' + previous.subcategory) if previous.subcategory else ''}",
+        )
+        if self.teach_status_label:
+            self.teach_status_label.setText(f"CleanShot learned this as {label}.")
         self.refresh_overview()
-        QMessageBox.information(self, "CleanShot", f"Learned this example as {category}{('/' + subcategory) if subcategory else ''}.")
+        QMessageBox.information(self, "CleanShot", f"CleanShot learned this as {label}.")
 
     def _stat_card(self, label: str, value_label: QLabel) -> QFrame:
         card = self._card()
@@ -567,8 +641,13 @@ class MainWindow(QMainWindow):
 
         title = QLabel(label)
         title.setObjectName("CardTitle")
-        value_label.setObjectName("CardValue")
+        if value_label in (self.brain_label, self.classifier_status_label):
+            value_label.setObjectName("CardValueSmall")
+        else:
+            value_label.setObjectName("CardValue")
         value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        value_label.setWordWrap(False)
+        value_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
 
         layout.addWidget(title)
         layout.addStretch(1)
@@ -652,7 +731,19 @@ class MainWindow(QMainWindow):
         if self.mode_label:
             self.mode_label.setText(self._mode_display(self.config.get("organization_mode", "day")))
         if self.brain_label:
-            self.brain_label.setText(f"{memory_count():,} / {taught_count():,} taught")
+            stats_memory = memory_stats()
+            self.brain_label.setText(
+                f"{stats_memory['total']:,} total · {stats_memory['manual_teach']:,} manual · "
+                f"{stats_memory['learn_from_folder']:,} folder · {stats_memory['auto_observed']:,} auto"
+            )
+        if self.classifier_status_label:
+            status = recognition_status()
+            parts = [
+                "OCR on" if self.config.get("enable_ocr", False) else "OCR off",
+                "App detection on",
+                "Advanced on" if status.get("pillow") else "Advanced limited",
+            ]
+            self.classifier_status_label.setText(" · ".join(parts))
 
         if self.status_label:
             self.status_label.setText("Watching" if self.watcher and self.watcher.is_running else "Stopped")
@@ -757,6 +848,9 @@ class MainWindow(QMainWindow):
             reason = str(record.get("reason") or "").strip()
             destination = str(record.get("destination") or "").strip()
             source = str(record.get("source") or "").strip()
+            classifier_source = str(record.get("classifier_source") or "").strip()
+            matched_rule = str(record.get("matched_rule") or "").strip()
+            app_name = str(record.get("app_name") or "").strip()
             message_text = str(record.get("message", "Activity"))
 
             time_label = QLabel(time_text)
@@ -791,6 +885,12 @@ class MainWindow(QMainWindow):
             if category:
                 label = category if not subcategory else f"{category}/{subcategory}"
                 detail_bits.append(label)
+            if classifier_source:
+                detail_bits.append(f"Source: {classifier_source}")
+            if app_name and app_name != "Unknown App":
+                detail_bits.append(f"App: {app_name}")
+            if matched_rule:
+                detail_bits.append(matched_rule)
             if reason:
                 detail_bits.append(reason[:90])
             elif source:
@@ -865,6 +965,13 @@ class MainWindow(QMainWindow):
         path = expand_path(folder)
         path.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _open_file(self, file_path: str | Path) -> None:
+        path = Path(file_path).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_text("{\n  \"version\": 3,\n  \"visual_memory\": [],\n  \"sessions\": [],\n  \"manual_rules\": {},\n  \"teach_history\": []\n}\n", encoding="utf-8")
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
 
     def save_settings(self) -> None:
         if not all([
@@ -957,13 +1064,43 @@ class MainWindow(QMainWindow):
 
     def learn_from_folders(self) -> None:
         learned = learn_from_output_folders(self.config)
-        append_activity("brain", f"Learned {learned} visual pattern(s) from existing folders")
+        append_activity("brain", f"Learned {learned} folder pattern(s) from existing folders", classifier_source="folder_learning")
         self.refresh_overview()
         QMessageBox.information(
             self,
             "CleanShot",
             f"CleanShot learned {learned} visual pattern(s).\n\nBrain file:\n{brain_path()}",
         )
+
+    def reset_learning(self) -> None:
+        confirm = QMessageBox.question(
+            self,
+            "CleanShot",
+            "Reset all manual, folder, and auto learning memory?",
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        reset_learning_memory()
+        append_activity("brain", "Reset learning memory", classifier_source="manual_teach")
+        if self.teach_status_label:
+            self.teach_status_label.setText("Learning memory reset.")
+        self.refresh_overview()
+
+    def forget_wrong_matches(self) -> None:
+        if not self.teach_category_input or not self.teach_subcategory_input:
+            return
+        category = self.teach_category_input.currentText().strip()
+        subcategory = self.teach_subcategory_input.currentText().strip()
+        if not category:
+            QMessageBox.warning(self, "CleanShot", "Choose the category to forget.")
+            return
+        removed = forget_examples(category=category, subcategory=subcategory or None)
+        label = category + (("/" + subcategory) if subcategory else "")
+        append_activity("brain", f"Forgot {removed} learned example(s) for {label}", classifier_source="manual_teach")
+        if self.teach_status_label:
+            self.teach_status_label.setText(f"Forgot {removed} learned example(s) for {label}.")
+        self.refresh_overview()
+        QMessageBox.information(self, "CleanShot", f"Forgot {removed} learned example(s) for {label}.")
 
     def _start_watcher(self) -> None:
         try:

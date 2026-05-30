@@ -8,7 +8,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from cleanshot.core.brain import brain_path, teach_image
+from cleanshot.core.brain import brain_path, mark_override, teach_image
+from cleanshot.core.classifier import classify_smart_screenshot
 from cleanshot.core.config import load_config
 
 
@@ -19,12 +20,17 @@ def main() -> int:
     parser.add_argument("subcategory", nargs="?", default="", help="Optional subcategory, e.g. JavaScript")
     args = parser.parse_args()
 
-    ok = teach_image(Path(args.image), args.category, args.subcategory, load_config())
+    config = load_config()
+    image = Path(args.image).expanduser().resolve()
+    previous = classify_smart_screenshot(image, config) if image.exists() else None
+    ok = teach_image(image, args.category, args.subcategory, config)
     if not ok:
         print("Could not teach from that image.")
         return 1
+    if previous and (previous.category != args.category or previous.subcategory != args.subcategory):
+        mark_override(previous.category, previous.subcategory, args.category, args.subcategory)
     label = args.category + (("/" + args.subcategory) if args.subcategory else "")
-    print(f"Learned {args.image} as {label}")
+    print(f"CleanShot learned this as {label}.")
     print(f"Brain: {brain_path()}")
     return 0
 

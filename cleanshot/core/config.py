@@ -21,7 +21,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "recursive_watch": False,
     "copy_instead_of_move": False,
     "enable_ocr": False,
-    "smart_confidence_threshold": 0.72,
+    "smart_confidence_threshold": 0.70,
     "smart_subfolders": True,
     "review_low_confidence": True,
     "enable_visual_memory": True,
@@ -117,7 +117,7 @@ def normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         merged[key] = bool(merged.get(key, DEFAULT_CONFIG.get(key, False)))
 
     for threshold_key, default_value in [
-        ("smart_confidence_threshold", 0.72),
+        ("smart_confidence_threshold", 0.70),
         ("neuro_similarity_threshold", 0.86),
     ]:
         try:
