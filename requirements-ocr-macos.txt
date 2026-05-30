@@ -1,0 +1,5 @@
+# Optional native macOS OCR / Vision support.
+# CleanShot works without this. Install only if you want Apple Vision experiments.
+pyobjc-core>=12.0
+pyobjc-framework-Vision>=12.0
+pyobjc-framework-Quartz>=12.0

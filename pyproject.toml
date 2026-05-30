@@ -1,0 +1,13 @@
+[project]
+name = "cleanshot"
+version = "1.0.0"
+description = "A modern local screenshot organizer for macOS and Windows with Smart Mode, code-language recognition, app detection, OCR support, teachable learning, and a clean PySide6 UI."
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6>=6.7.0",
+    "watchdog>=4.0.0",
+    "Pillow>=10.0.0",
+]
+
+[tool.ruff]
+line-length = 110
